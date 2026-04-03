@@ -22,6 +22,7 @@ from ._op import (
     extract_entities,
     get_chunks,
     videorag_query,
+    videorag_query_activity_summary,
     videorag_query_multiple_choice,
 )
 from ._storage import (
@@ -331,6 +332,21 @@ class VideoRAG:
                 self.video_segment_feature_vdb,
                 self.chunk_entity_relation_graph,
                 self.caption_model, 
+                self.caption_tokenizer,
+                param,
+                asdict(self),
+            )
+        elif param.mode == "activity_summary":
+            response = await videorag_query_activity_summary(
+                query,
+                self.entities_vdb,
+                self.text_chunks,
+                self.chunks_vdb,
+                self.video_path_db,
+                self.video_segments,
+                self.video_segment_feature_vdb,
+                self.chunk_entity_relation_graph,
+                self.caption_model,
                 self.caption_tokenizer,
                 param,
                 asdict(self),

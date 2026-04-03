@@ -366,6 +366,57 @@ In one segment, the film highlights the devastating effects of deforestation on 
 Please add sections and commentary as appropriate for the length and format if necessary. Format the response in Markdown.
 """
 
+# Fixed strings for ``activity_summary`` mode (no LLM query rewrite / keyword extraction).
+PROMPTS["fixed_activity_retrieval_query"] = (
+    "Human activities, body movements, actions, interactions between people and objects, "
+    "tools, scene context, dialogue, and temporally ordered events in the video."
+)
+
+PROMPTS["fixed_activity_caption_focus"] = (
+    "human activities, actions, body movements, interactions with objects and other people, "
+    "scene context, and important events visible in the frames"
+)
+
+PROMPTS["activity_summary_user_message"] = (
+    "Generate the Human Activity Recognition listing and chronological summary using only "
+    "the evidence provided in the system message. Follow the required sections and format."
+)
+
+PROMPTS["activity_summary_system"] = """---Role---
+
+You are an expert assistant for Human Activity Recognition (HAR) and video summarization.
+
+---Goal---
+
+Using **only** the evidence in the segment table and text chunks below, produce:
+
+1. **Activities** — Distinct activities or action patterns, with approximate time ranges from the table when possible.
+2. **Timeline summary** — Short chronological narrative of what happens.
+3. **Key entities** — People, objects, and locations that matter for understanding the activities.
+
+**Rules**
+
+- Do not state facts that are not supported by the retrieved content.
+- If evidence is thin or missing, say so briefly.
+- Use Markdown. When citing evidence, mention `video_name` and start/end times from the table.
+
+---Target response length and format---
+
+{response_type}
+
+---Segment-level video evidence (CSV)---
+
+{video_data}
+
+---Text chunks (rough captions / transcripts)---
+
+{chunk_data}
+
+---Output---
+
+Write the three sections (Activities, Timeline summary, Key entities). Stay concrete and activity-focused.
+"""
+
 PROMPTS[
     "videorag_response_wo_reference"
 ] = """---Role---

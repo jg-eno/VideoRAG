@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import TypedDict, Union, Literal, Generic, TypeVar
+from typing import Any, Dict, Literal, Optional, TypedDict, Union, Generic, TypeVar
 
 import numpy as np
 
@@ -8,15 +8,26 @@ from ._utils import EmbeddingFunc
 
 @dataclass
 class QueryParam:
-    mode: Literal["local", "global", "naive"] = "global"
+    mode: Literal[
+        "local",
+        "global",
+        "naive",
+        "videorag",
+        "videorag_multiple_choice",
+        "activity_summary",
+    ] = "global"
     only_need_context: bool = False
     response_type: str = "Multiple Paragraphs"
     level: int = 2
     top_k: int = 20
     # naive search
     naive_max_token_for_text_unit = 12000
-    # videorag search
-    only_need_context: bool = False
+    # Query-time chunk context: training-free query-aware packing vs prefix truncation
+    use_query_aware_chunk_compression: bool = False
+    # If set to an empty dict before ``aquery``, filled with compression metrics (optional)
+    compression_metrics: Optional[Dict[str, Any]] = None
+    # activity_summary mode: cap how many segments get fine captioning (None = all retrieved)
+    activity_summary_max_segments: Optional[int] = None
 
 
 TextChunkSchema = TypedDict(

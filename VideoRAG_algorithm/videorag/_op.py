@@ -31,6 +31,11 @@ from .prompt import GRAPH_FIELD_SEP, PROMPTS
 from ._videoutil import (
     retrieved_segment_caption,
 )
+from .context_compression import (
+    compute_context_compression_metrics,
+    select_chunks_baseline,
+    select_chunks_query_aware,
+)
 
 def chunking_by_token_size(
     tokens_list: list[list[int]],
@@ -601,14 +606,48 @@ async def videorag_query(
     chunks_ids = [r["id"] for r in results]
     chunks = await text_chunks_db.get_by_ids(chunks_ids)
 
-    maybe_trun_chunks = truncate_list_by_token_size(
-        chunks,
-        key=lambda x: x["content"],
-        max_token_size=query_param.naive_max_token_for_text_unit,
+    budget = query_param.naive_max_token_for_text_unit
+    tik_model = global_config.get("tiktoken_model_name", "gpt-4o")
+    valid_chunks = [c for c in chunks if c is not None]
+
+    _, baseline_ctx = select_chunks_baseline(valid_chunks, budget)
+    full_pool_ctx = "-----New Chunk-----\n".join(
+        c["content"] for c in valid_chunks if c.get("content")
     )
-    logger.info(f"Truncate {len(chunks)} to {len(maybe_trun_chunks)} chunks")
-    section = "-----New Chunk-----\n".join([c["content"] for c in maybe_trun_chunks])
-    retreived_chunk_context = section
+
+    if query_param.use_query_aware_chunk_compression:
+        maybe_trun_chunks, compressed_ctx = select_chunks_query_aware(
+            valid_chunks,
+            query,
+            budget,
+            tik_model,
+        )
+        logger.info(
+            f"Query-aware chunk context: {len(maybe_trun_chunks)} chunks "
+            f"(baseline prefix would use truncate_list_by_token_size)"
+        )
+        retreived_chunk_context = compressed_ctx
+        if query_param.compression_metrics is not None:
+            query_param.compression_metrics.clear()
+            query_param.compression_metrics.update(
+                compute_context_compression_metrics(
+                    query,
+                    baseline_ctx,
+                    compressed_ctx,
+                    full_pool_ctx,
+                    tik_model,
+                )
+            )
+    else:
+        maybe_trun_chunks = truncate_list_by_token_size(
+            chunks,
+            key=lambda x: x["content"],
+            max_token_size=budget,
+        )
+        logger.info(f"Truncate {len(chunks)} to {len(maybe_trun_chunks)} chunks")
+        retreived_chunk_context = "-----New Chunk-----\n".join(
+            c["content"] for c in maybe_trun_chunks
+        )
     
     # visual retrieval
     query_for_entity_retrieval = await _refine_entity_retrieval_query(
@@ -743,6 +782,176 @@ async def videorag_query(
     )
     return response
 
+
+async def videorag_query_activity_summary(
+    query,
+    entities_vdb,
+    text_chunks_db,
+    chunks_vdb,
+    video_path_db,
+    video_segments,
+    video_segment_feature_vdb,
+    knowledge_graph_inst,
+    caption_model,
+    caption_tokenizer,
+    query_param: QueryParam,
+    global_config: dict,
+) -> str:
+    """
+    HAR + summarization path: fixed retrieval anchor and caption focus, no LLM query
+    rewrite, no per-segment relevance filter, no keyword-extraction LLM.
+    Still runs vision captioning on selected segments and one final LLM call.
+    """
+    use_model_func = global_config["llm"]["best_model_func"]
+    anchor = PROMPTS["fixed_activity_retrieval_query"]
+    fallback_q = (query or "").strip() or anchor
+
+    # --- text chunks (same budget logic as videorag, retrieval from fixed anchor) ---
+    results = await chunks_vdb.query(anchor, top_k=query_param.top_k)
+    if not len(results) and fallback_q != anchor:
+        results = await chunks_vdb.query(fallback_q, top_k=query_param.top_k)
+
+    budget = query_param.naive_max_token_for_text_unit
+    tik_model = global_config.get("tiktoken_model_name", "gpt-4o")
+    retreived_chunk_context = ""
+    if len(results):
+        chunks_ids = [r["id"] for r in results]
+        chunks = await text_chunks_db.get_by_ids(chunks_ids)
+        valid_chunks = [c for c in chunks if c is not None]
+        if valid_chunks:
+            _, baseline_ctx = select_chunks_baseline(valid_chunks, budget)
+            full_pool_ctx = "-----New Chunk-----\n".join(
+                c["content"] for c in valid_chunks if c.get("content")
+            )
+            if query_param.use_query_aware_chunk_compression:
+                _, compressed_ctx = select_chunks_query_aware(
+                    valid_chunks,
+                    anchor,
+                    budget,
+                    tik_model,
+                )
+                retreived_chunk_context = compressed_ctx
+                if query_param.compression_metrics is not None:
+                    query_param.compression_metrics.clear()
+                    query_param.compression_metrics.update(
+                        compute_context_compression_metrics(
+                            anchor,
+                            baseline_ctx,
+                            compressed_ctx,
+                            full_pool_ctx,
+                            tik_model,
+                        )
+                    )
+            else:
+                maybe_trun = truncate_list_by_token_size(
+                    chunks,
+                    key=lambda x: x["content"],
+                    max_token_size=budget,
+                )
+                retreived_chunk_context = "-----New Chunk-----\n".join(
+                    c["content"] for c in maybe_trun
+                )
+    if not retreived_chunk_context.strip():
+        retreived_chunk_context = "(No text chunks retrieved for this index.)"
+
+    # --- segments: fixed anchor embedding queries (no LLM rewrites) ---
+    entity_results = await entities_vdb.query(anchor, top_k=query_param.top_k)
+    entity_retrieved_segments = set()
+    if len(entity_results):
+        node_datas = await asyncio.gather(
+            *[knowledge_graph_inst.get_node(r["entity_name"]) for r in entity_results]
+        )
+        if not all([n is not None for n in node_datas]):
+            logger.warning("Some nodes are missing, maybe the storage is damaged")
+        node_degrees = await asyncio.gather(
+            *[knowledge_graph_inst.node_degree(r["entity_name"]) for r in entity_results]
+        )
+        node_datas = [
+            {**n, "entity_name": k["entity_name"], "rank": d}
+            for k, n, d in zip(entity_results, node_datas, node_degrees)
+            if n is not None
+        ]
+        entity_retrieved_segments = entity_retrieved_segments.union(
+            await _find_most_related_segments_from_entities(
+                global_config["retrieval_topk_chunks"],
+                node_datas,
+                text_chunks_db,
+                knowledge_graph_inst,
+            )
+        )
+
+    segment_results = await video_segment_feature_vdb.query(anchor)
+    visual_retrieved_segments = set()
+    if len(segment_results):
+        for n in segment_results:
+            visual_retrieved_segments.add(n["__id__"])
+
+    retrieved_segments = list(entity_retrieved_segments.union(visual_retrieved_segments))
+    retrieved_segments = sorted(
+        retrieved_segments,
+        key=lambda x: (
+            "_".join(x.split("_")[:-1]),
+            eval(x.split("_")[-1]),
+        ),
+    )
+    logger.info(
+        "activity_summary: %d entity segments, %d visual segments, %d merged",
+        len(entity_retrieved_segments),
+        len(visual_retrieved_segments),
+        len(retrieved_segments),
+    )
+
+    if not retrieved_segments:
+        return (
+            "No video segments were retrieved for activity summarization. "
+            "Build the index with the same working_dir and ensure naive RAG / segments exist."
+        )
+
+    cap = query_param.activity_summary_max_segments
+    if cap is not None and cap > 0 and len(retrieved_segments) > cap:
+        retrieved_segments = retrieved_segments[:cap]
+        logger.info("activity_summary: capped segments to %d", cap)
+
+    keywords_for_caption = PROMPTS["fixed_activity_caption_focus"]
+    caption_results = retrieved_segment_caption(
+        caption_model,
+        caption_tokenizer,
+        keywords_for_caption,
+        retrieved_segments,
+        video_path_db,
+        video_segments,
+        num_sampled_frames=global_config["fine_num_frames_per_segment"],
+    )
+
+    text_units_section_list = [["video_name", "start_time", "end_time", "content"]]
+    for s_id in caption_results:
+        video_name = "_".join(s_id.split("_")[:-1])
+        index = s_id.split("_")[-1]
+        start_time = eval(video_segments._data[video_name][index]["time"].split("-")[0])
+        end_time = eval(video_segments._data[video_name][index]["time"].split("-")[1])
+        start_time = f"{start_time // 3600}:{(start_time % 3600) // 60}:{start_time % 60}"
+        end_time = f"{end_time // 3600}:{(end_time % 3600) // 60}:{end_time % 60}"
+        text_units_section_list.append(
+            [video_name, start_time, end_time, caption_results[s_id]]
+        )
+    text_units_context = list_of_list_to_csv(text_units_section_list)
+    retreived_video_context = (
+        f"\n-----Retrieved Knowledge From Videos-----\n```csv\n{text_units_context}\n```\n"
+    )
+
+    sys_prompt = PROMPTS["activity_summary_system"].format(
+        video_data=retreived_video_context,
+        chunk_data=retreived_chunk_context,
+        response_type=query_param.response_type,
+    )
+    user_message = PROMPTS["activity_summary_user_message"]
+    response = await use_model_func(
+        user_message,
+        system_prompt=sys_prompt,
+    )
+    return response
+
+
 async def videorag_query_multiple_choice(
     query,
     entities_vdb,
@@ -770,14 +979,47 @@ async def videorag_query_multiple_choice(
         chunks_ids = [r["id"] for r in results]
         chunks = await text_chunks_db.get_by_ids(chunks_ids)
 
-        maybe_trun_chunks = truncate_list_by_token_size(
-            chunks,
-            key=lambda x: x["content"],
-            max_token_size=query_param.naive_max_token_for_text_unit,
+        budget = query_param.naive_max_token_for_text_unit
+        tik_model = global_config.get("tiktoken_model_name", "gpt-4o")
+        valid_chunks = [c for c in chunks if c is not None]
+
+        _, baseline_ctx = select_chunks_baseline(valid_chunks, budget)
+        full_pool_ctx = "-----New Chunk-----\n".join(
+            c["content"] for c in valid_chunks if c.get("content")
         )
-        logger.info(f"Truncate {len(chunks)} to {len(maybe_trun_chunks)} chunks")
-        section = "-----New Chunk-----\n".join([c["content"] for c in maybe_trun_chunks])
-        retreived_chunk_context = section
+
+        if query_param.use_query_aware_chunk_compression:
+            maybe_trun_chunks, compressed_ctx = select_chunks_query_aware(
+                valid_chunks,
+                query,
+                budget,
+                tik_model,
+            )
+            logger.info(
+                f"Query-aware chunk context: {len(maybe_trun_chunks)} chunks"
+            )
+            retreived_chunk_context = compressed_ctx
+            if query_param.compression_metrics is not None:
+                query_param.compression_metrics.clear()
+                query_param.compression_metrics.update(
+                    compute_context_compression_metrics(
+                        query,
+                        baseline_ctx,
+                        compressed_ctx,
+                        full_pool_ctx,
+                        tik_model,
+                    )
+                )
+        else:
+            maybe_trun_chunks = truncate_list_by_token_size(
+                chunks,
+                key=lambda x: x["content"],
+                max_token_size=budget,
+            )
+            logger.info(f"Truncate {len(chunks)} to {len(maybe_trun_chunks)} chunks")
+            retreived_chunk_context = "-----New Chunk-----\n".join(
+                c["content"] for c in maybe_trun_chunks
+            )
     else:
         retreived_chunk_context = "No Content"
         
